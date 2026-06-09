@@ -1,0 +1,36 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Task {
+  id           String    @id @default(uuid())
+  name         String    // e.g., "send_email", "process_video"
+  queue        String    @default("default")
+  status       String    // "pending" | "processing" | "completed" | "failed"
+  payload      Json
+  retryCount   Int       @default(0)
+  maxRetries   Int       @default(3)
+  runAt        DateTime  @default(now())
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  errorMessage String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  logs         TaskLog[]
+
+  @@index([status, runAt])
+}
+
+model TaskLog {
+  id        String   @id @default(uuid())
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  message   String
+  level     String   @default("info") // "info" | "error"
+  createdAt DateTime @default(now())
+}
