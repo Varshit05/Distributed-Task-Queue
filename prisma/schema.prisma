@@ -15,6 +15,7 @@ model Task {
   payload      Json
   retryCount   Int       @default(0)
   maxRetries   Int       @default(3)
+  timeoutMs    Int?      // Max execution duration in milliseconds
   runAt        DateTime  @default(now())
   startedAt    DateTime?
   finishedAt   DateTime?
@@ -34,3 +35,19 @@ model TaskLog {
   level     String   @default("info") // "info" | "error"
   createdAt DateTime @default(now())
 }
+
+model CronJob {
+  id           String    @id @default(uuid())
+  name         String    @unique // E.g., "cleanup-job"
+  taskName     String    // E.g., "send_email"
+  expression   String    // Cron expression e.g. "*/5 * * * *"
+  payload      Json      // Arguments passed to the task
+  isActive     Boolean   @default(true)
+  nextRunAt    DateTime  // Scheduled time for the next execution
+  lastRunAt    DateTime? // Last time this job was successfully triggered
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([isActive, nextRunAt])
+}
+

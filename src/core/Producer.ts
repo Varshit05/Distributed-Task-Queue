@@ -5,6 +5,7 @@ export interface SubmitTaskOptions {
   delayMs?: number;      // Optional delay in milliseconds
   maxRetries?: number;   // Optional maximum retry count (defaults to 3)
   queue?: string;        // Optional queue name (defaults to "default")
+  timeoutMs?: number;    // Optional execution timeout in milliseconds
 }
 
 export class Producer {
@@ -35,6 +36,7 @@ export class Producer {
         status: 'pending',
         payload,
         maxRetries,
+        timeoutMs: options.timeoutMs,
         runAt,
       },
     });

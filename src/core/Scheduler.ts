@@ -1,14 +1,19 @@
 import { Redis } from 'ioredis';
+import parser from 'cron-parser';
 import { db } from '../config/database.js';
 import { createRedisClient } from '../config/redis.js';
+import { Producer } from './Producer.js';
 
 export class Scheduler {
   private redisClient: Redis;
   private running = false;
   private timer: NodeJS.Timeout | null = null;
   private recoveryTimer: NodeJS.Timeout | null = null;
+  private cronTimer: NodeJS.Timeout | null = null;
+  private pruningTimer: NodeJS.Timeout | null = null;
   private groupName: string;
   private claimTimeoutMs: number; // Time after which a task is considered stuck/crashed
+
 
   constructor() {
     this.redisClient = createRedisClient();
@@ -83,8 +88,32 @@ export class Scheduler {
       this.recoveryTimer = setTimeout(pollRecovery, 10000);
     };
 
+    // Loop 3: Poll Cron Jobs every 5 seconds
+    const pollCron = async () => {
+      if (!this.running) return;
+      try {
+        await this.dispatchCronJobs();
+      } catch (error) {
+        console.error('[Scheduler] Error dispatching cron jobs:', error);
+      }
+      this.cronTimer = setTimeout(pollCron, 5000);
+    };
+
+    // Loop 4: Poll Pruning every 1 hour
+    const pollPruning = async () => {
+      if (!this.running) return;
+      try {
+        await this.pruneOldTasks();
+      } catch (error) {
+        console.error('[Scheduler] Error pruning execution history:', error);
+      }
+      this.pruningTimer = setTimeout(pollPruning, 3600000);
+    };
+
     pollDelayed();
     pollRecovery();
+    pollCron();
+    pollPruning();
   }
 
   /**
@@ -95,6 +124,8 @@ export class Scheduler {
     this.running = false;
     if (this.timer) clearTimeout(this.timer);
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    if (this.cronTimer) clearTimeout(this.cronTimer);
+    if (this.pruningTimer) clearTimeout(this.pruningTimer);
     await this.redisClient.quit();
     console.log('[Scheduler] Scheduler stopped.');
   }
@@ -231,16 +262,31 @@ export class Scheduler {
               // Max retries exceeded
               console.log(`[Scheduler] Mark task ${taskId} as failed. Retries exhausted.`);
 
+              const failMsg = `Worker "${consumerName}" crashed or timed out. Retries exhausted.`;
               await db.task.update({
                 where: { id: taskId },
                 data: {
                   status: 'failed',
                   finishedAt: new Date(),
-                  errorMessage: `Worker "${consumerName}" crashed or timed out. Retries exhausted.`,
+                  errorMessage: failMsg,
                 },
               });
 
-              await taskLogger(`Worker "${consumerName}" crashed or timed out. Retries exhausted. Marking task as permanently failed.`, 'error');
+              await taskLogger(failMsg, 'error');
+
+              // Route to DLQ stream
+              try {
+                await this.redisClient.xadd(
+                  'task_stream:dlq',
+                  '*',
+                  'id', taskId,
+                  'originalQueue', queue,
+                  'error', failMsg
+                );
+                console.log(`[Scheduler] Routed recovery-failed task ${taskId} to Dead Letter Queue (DLQ)`);
+              } catch (dlqError) {
+                console.error(`[Scheduler] Failed to push recovery-failed task ${taskId} to DLQ:`, dlqError);
+              }
 
               // Acknowledge the old message to remove it from the PEL
               await this.redisClient.xack(streamKey, this.groupName, messageId);
@@ -257,5 +303,79 @@ export class Scheduler {
         }
       }
     }
+  }
+
+  /**
+   * Scans the database for active cron jobs whose nextRunAt timestamp is due,
+   * calculates their next scheduled runtime, atomically updates the nextRunAt,
+   * and triggers the associated task if the update is claimed.
+   */
+  private async dispatchCronJobs(): Promise<void> {
+    const now = new Date();
+
+    const dueJobs = await db.cronJob.findMany({
+      where: {
+        isActive: true,
+        nextRunAt: {
+          lte: now,
+        },
+      },
+    });
+
+    if (dueJobs.length === 0) return;
+
+    for (const job of dueJobs) {
+      try {
+        const interval = parser.parse(job.expression, { currentDate: now });
+        const nextRunAt = interval.next().toDate();
+
+        // Perform optimistic locking update to ensure distributed safety
+        const updatedCount = await db.cronJob.updateMany({
+          where: {
+            id: job.id,
+            nextRunAt: job.nextRunAt,
+          },
+          data: {
+            nextRunAt,
+            lastRunAt: now,
+          },
+        });
+
+        if (updatedCount.count === 1) {
+          console.log(`[Scheduler] Optimistic lock won. Triggering cron job "${job.name}" (next run: ${nextRunAt.toISOString()})`);
+          
+          await Producer.submitTask(job.taskName, job.payload as Record<string, any>, {
+            queue: 'default',
+          });
+        }
+      } catch (err: any) {
+        console.error(`[Scheduler] Failed to process cron job "${job.name}":`, err.message);
+      }
+    }
+  }
+
+  /**
+   * Automatically deletes completed or failed tasks and associated logs
+   * that finished more than 7 days ago to prevent database bloat.
+   */
+  public async pruneOldTasks(daysToKeep = 7): Promise<number> {
+    const pruneBefore = new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000);
+    console.log(`[Scheduler] Pruning tasks finished before ${pruneBefore.toISOString()}...`);
+
+    const result = await db.task.deleteMany({
+      where: {
+        status: {
+          in: ['completed', 'failed'],
+        },
+        finishedAt: {
+          lt: pruneBefore,
+        },
+      },
+    });
+
+    if (result.count > 0) {
+      console.log(`[Scheduler] Successfully pruned ${result.count} tasks and their associated logs.`);
+    }
+    return result.count;
   }
 }

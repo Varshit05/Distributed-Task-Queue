@@ -194,9 +194,24 @@ export class Worker {
         throw new Error(`No handler registered for task type: "${task.name}"`);
       }
 
-      // 4. Run handler
-      // If task payload is Json, it might need parsing or is already an object depending on Prisma
-      const result = await handler(task.payload, taskLogger, { taskId: task.id, retryCount: task.retryCount });
+      // 4. Run handler with optional timeout
+      let executionPromise = handler(task.payload, taskLogger, { taskId: task.id, retryCount: task.retryCount });
+      let timeoutId: NodeJS.Timeout | undefined;
+
+      const timeoutMs = task.timeoutMs;
+      if (timeoutMs && timeoutMs > 0) {
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => {
+            reject(new Error(`Task execution timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        });
+        executionPromise = Promise.race([executionPromise, timeoutPromise]);
+      }
+
+      const result = await executionPromise;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
 
       // 5. Successful Execution
       await db.task.update({
@@ -286,6 +301,20 @@ export class Worker {
           level: 'error',
         },
       });
+
+      // Route to DLQ stream
+      try {
+        await this.redisClient.xadd(
+          'task_stream:dlq',
+          '*',
+          'id', taskId,
+          'originalQueue', this.queue,
+          'error', errorMessage
+        );
+        console.log(`[Worker ${this.workerId}] Routed task ${taskId} to Dead Letter Queue (DLQ)`);
+      } catch (dlqError) {
+        console.error(`[Worker ${this.workerId}] Failed to push task ${taskId} to DLQ:`, dlqError);
+      }
 
       // Acknowledge to remove it from PEL
       await this.redisClient.xack(this.streamKey, this.groupName, messageId);
