@@ -14,6 +14,8 @@ export class Worker {
   private running = false;
   private workerId: string;
   private queue: string;
+  private queues: string[];
+  private streamKeys: string[];
   private handlers: Map<string, TaskHandler> = new Map();
   private streamKey: string;
   private groupName: string;
@@ -21,9 +23,15 @@ export class Worker {
 
   constructor(queue = 'default') {
     this.queue = queue;
+    this.queues = queue.split(',').map(q => q.trim()).filter(Boolean);
+    if (this.queues.length === 0) {
+      this.queues = ['default'];
+      this.queue = 'default';
+    }
     this.redisClient = createRedisClient();
     this.workerId = `worker:${os.hostname()}:${process.pid}:${Math.random().toString(36).substring(2, 8)}`;
-    this.streamKey = `task_stream:${queue}`;
+    this.streamKeys = this.queues.map(q => `task_stream:${q}`);
+    this.streamKey = this.streamKeys[0];
     this.groupName = process.env.QUEUE_GROUP_NAME || 'worker_group';
   }
 
@@ -41,7 +49,7 @@ export class Worker {
   public async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    console.log(`[Worker ${this.workerId}] Starting consumer on queue: "${this.queue}"`);
+    console.log(`[Worker ${this.workerId}] Starting consumer on queues: "${this.queue}"`);
 
     // Ensure Consumer Group exists
     await this.ensureConsumerGroup();
@@ -67,19 +75,21 @@ export class Worker {
   }
 
   private async ensureConsumerGroup(): Promise<void> {
-    try {
-      // Create consumer group. 
-      // MKSTREAM option creates the stream if it doesn't already exist.
-      // '$' means read only new messages starting from now.
-      await this.redisClient.xgroup('CREATE', this.streamKey, this.groupName, '$', 'MKSTREAM');
-      console.log(`[Worker ${this.workerId}] Created consumer group "${this.groupName}" for stream "${this.streamKey}"`);
-    } catch (error: any) {
-      if (error.message && error.message.includes('BUSYGROUP')) {
-        // Group already exists, which is expected on restarts
-        console.log(`[Worker ${this.workerId}] Consumer group "${this.groupName}" already exists for stream "${this.streamKey}"`);
-      } else {
-        console.error(`[Worker ${this.workerId}] Error creating consumer group:`, error);
-        throw error;
+    for (const streamKey of this.streamKeys) {
+      try {
+        // Create consumer group. 
+        // MKSTREAM option creates the stream if it doesn't already exist.
+        // '0' means read all messages from the beginning of the stream.
+        await this.redisClient.xgroup('CREATE', streamKey, this.groupName, '0', 'MKSTREAM');
+        console.log(`[Worker ${this.workerId}] Created consumer group "${this.groupName}" for stream "${streamKey}"`);
+      } catch (error: any) {
+        if (error.message && error.message.includes('BUSYGROUP')) {
+          // Group already exists, which is expected on restarts
+          console.log(`[Worker ${this.workerId}] Consumer group "${this.groupName}" already exists for stream "${streamKey}"`);
+        } else {
+          console.error(`[Worker ${this.workerId}] Error creating consumer group for ${streamKey}:`, error);
+          throw error;
+        }
       }
     }
   }
@@ -87,44 +97,61 @@ export class Worker {
   private async runLoop(): Promise<void> {
     while (this.running) {
       try {
-        // Read messages from consumer group
-        // COUNT 1: Read one message at a time
-        // BLOCK 2000: Block for 2 seconds if no message is available
-        // '>' means read only new messages (not delivered to other consumers yet)
-        const response = await this.redisClient.xreadgroup(
-          'GROUP', this.groupName, this.workerId,
-          'COUNT', '1',
-          'BLOCK', '2000',
-          'STREAMS', this.streamKey,
-          '>'
-        ) as any;
+        let response: any = null;
+
+        // 1. Non-blocking check of each stream in priority order
+        for (const streamKey of this.streamKeys) {
+          const res = await this.redisClient.xreadgroup(
+            'GROUP', this.groupName, this.workerId,
+            'COUNT', '1',
+            'STREAMS', streamKey,
+            '>'
+          ) as any;
+
+          if (res && res.length > 0 && res[0][1].length > 0) {
+            response = res;
+            break;
+          }
+        }
+
+        // 2. If all streams were empty, block on all streams together
+        if (!response) {
+          response = await this.redisClient.xreadgroup(
+            'GROUP', this.groupName, this.workerId,
+            'COUNT', '1',
+            'BLOCK', '2000',
+            'STREAMS', ...this.streamKeys,
+            ...Array(this.streamKeys.length).fill('>')
+          ) as any;
+        }
 
         if (!response || response.length === 0) {
           continue; // Timeout, check if still running
         }
 
-        const [stream, messages] = response[0];
-        if (messages.length === 0) continue;
+        // Process all returned messages (usually just one, but handle multiple to prevent PEL leaks)
+        for (const streamResponse of response) {
+          const [stream, messages] = streamResponse;
+          if (messages.length === 0) continue;
 
-        const [messageId, fields] = messages[0];
-        // Parse fields (which is a flat array, e.g., ['id', 'uuid-value'])
-        const fieldsMap: Record<string, string> = {};
-        for (let i = 0; i < fields.length; i += 2) {
-          fieldsMap[fields[i]] = fields[i + 1];
+          const [messageId, fields] = messages[0];
+          const fieldsMap: Record<string, string> = {};
+          for (let i = 0; i < fields.length; i += 2) {
+            fieldsMap[fields[i]] = fields[i + 1];
+          }
+
+          const taskId = fieldsMap['id'];
+          if (!taskId) {
+            console.warn(`[Worker ${this.workerId}] Received malformed message in stream ${stream}: missing task ID. Acknowledging.`);
+            await this.redisClient.xack(stream, this.groupName, messageId);
+            continue;
+          }
+
+          // Process task asynchronously and capture its promise
+          this.activeTaskPromise = this.processTask(taskId, messageId, stream);
+          await this.activeTaskPromise;
+          this.activeTaskPromise = null;
         }
-
-        const taskId = fieldsMap['id'];
-        if (!taskId) {
-          // Bad message format, acknowledge to remove from PEL
-          console.warn(`[Worker ${this.workerId}] Received malformed message: missing task ID. Acknowledging.`);
-          await this.redisClient.xack(this.streamKey, this.groupName, messageId);
-          continue;
-        }
-
-        // Process task asynchronously and capture its promise
-        this.activeTaskPromise = this.processTask(taskId, messageId);
-        await this.activeTaskPromise;
-        this.activeTaskPromise = null;
 
       } catch (error: any) {
         console.error(`[Worker ${this.workerId}] Error in consumer loop:`, error);
@@ -145,24 +172,24 @@ export class Worker {
     }
   }
 
-  private async processTask(taskId: string, messageId: string): Promise<void> {
+  private async processTask(taskId: string, messageId: string, streamKey: string): Promise<void> {
     // 1. Fetch Task details from Postgres
     const task = await db.task.findUnique({ where: { id: taskId } });
 
     if (!task) {
       console.warn(`[Worker ${this.workerId}] Task ${taskId} not found in database. Acknowledging Redis stream message.`);
-      await this.redisClient.xack(this.streamKey, this.groupName, messageId);
+      await this.redisClient.xack(streamKey, this.groupName, messageId);
       return;
     }
 
     // Idempotency check: If task is already completed or failed, ack and skip
     if (task.status === 'completed' || task.status === 'failed') {
       console.warn(`[Worker ${this.workerId}] Task ${taskId} is already in a final state: "${task.status}". Acknowledging.`);
-      await this.redisClient.xack(this.streamKey, this.groupName, messageId);
+      await this.redisClient.xack(streamKey, this.groupName, messageId);
       return;
     }
 
-    console.log(`[Worker ${this.workerId}] Claimed task ${taskId} (${task.name})`);
+    console.log(`[Worker ${this.workerId}] Claimed task ${taskId} (${task.name}) from stream ${streamKey}`);
 
     // Helper logger inside the handler
     const taskLogger = async (message: string, level = 'info') => {
@@ -225,7 +252,7 @@ export class Worker {
       await taskLogger(`Task execution completed successfully. Result: ${JSON.stringify(result || {})}`);
 
       // Acknowledge in Redis Stream
-      await this.redisClient.xack(this.streamKey, this.groupName, messageId);
+      await this.redisClient.xack(streamKey, this.groupName, messageId);
       console.log(`[Worker ${this.workerId}] Successfully completed task ${taskId}`);
 
     } catch (error: any) {
@@ -233,7 +260,7 @@ export class Worker {
       await taskLogger(`Task execution failed: ${errorMsg}`, 'error');
 
       // 6. Handle Retry Mechanism / terminal failure
-      await this.handleFailure(task.id, task.name, task.payload, task.retryCount, task.maxRetries, errorMsg, messageId);
+      await this.handleFailure(task.id, task.name, task.payload, task.retryCount, task.maxRetries, errorMsg, messageId, task.queue, streamKey);
     }
   }
 
@@ -244,7 +271,9 @@ export class Worker {
     currentRetryCount: number,
     maxRetries: number,
     errorMessage: string,
-    messageId: string
+    messageId: string,
+    queueName: string,
+    streamKey: string
   ): Promise<void> {
     if (currentRetryCount < maxRetries) {
       const nextRetry = currentRetryCount + 1;
@@ -276,10 +305,10 @@ export class Worker {
 
       // Add task back to Redis Sorted Set for delayed execution
       const score = runAt.getTime();
-      await this.redisClient.zadd('delayed_tasks', score, `${taskId}:${this.queue}`);
+      await this.redisClient.zadd('delayed_tasks', score, `${taskId}:${queueName}`);
 
       // Acknowledge this specific execution turn in the active stream (since it is now scheduled as delayed)
-      await this.redisClient.xack(this.streamKey, this.groupName, messageId);
+      await this.redisClient.xack(streamKey, this.groupName, messageId);
 
     } else {
       // Terminal Failure
@@ -308,7 +337,7 @@ export class Worker {
           'task_stream:dlq',
           '*',
           'id', taskId,
-          'originalQueue', this.queue,
+          'originalQueue', queueName,
           'error', errorMessage
         );
         console.log(`[Worker ${this.workerId}] Routed task ${taskId} to Dead Letter Queue (DLQ)`);
@@ -317,7 +346,7 @@ export class Worker {
       }
 
       // Acknowledge to remove it from PEL
-      await this.redisClient.xack(this.streamKey, this.groupName, messageId);
+      await this.redisClient.xack(streamKey, this.groupName, messageId);
     }
   }
 }
