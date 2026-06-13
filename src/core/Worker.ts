@@ -20,6 +20,10 @@ export class Worker {
   private streamKey: string;
   private groupName: string;
   private activeTaskPromise: Promise<void> | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private heartbeatIntervalMs = 5000;
+  private heartbeatTtlSec = 15;
+  private startedAt: Date;
 
   constructor(queue = 'default') {
     this.queue = queue;
@@ -33,6 +37,7 @@ export class Worker {
     this.streamKeys = this.queues.map(q => `task_stream:${q}`);
     this.streamKey = this.streamKeys[0];
     this.groupName = process.env.QUEUE_GROUP_NAME || 'worker_group';
+    this.startedAt = new Date();
   }
 
   /**
@@ -49,10 +54,14 @@ export class Worker {
   public async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
+    this.startedAt = new Date();
     console.log(`[Worker ${this.workerId}] Starting consumer on queues: "${this.queue}"`);
 
     // Ensure Consumer Group exists
     await this.ensureConsumerGroup();
+
+    // Start heartbeats
+    await this.startHeartbeat();
 
     // Run loop
     this.runLoop();
@@ -65,13 +74,66 @@ export class Worker {
     console.log(`[Worker ${this.workerId}] Shutting down...`);
     this.running = false;
     
+    // Clear heartbeat timer
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+
     // Wait for the active task to complete execution
     if (this.activeTaskPromise) {
       await this.activeTaskPromise;
     }
 
+    // Unregister worker registry entries
+    try {
+      await this.redisClient
+        .multi()
+        .zrem('workers:active', this.workerId)
+        .del(`worker:info:${this.workerId}`)
+        .exec();
+      console.log(`[Worker ${this.workerId}] Unregistered from registry.`);
+    } catch (err) {
+      console.error(`[Worker ${this.workerId}] Failed to unregister during shutdown:`, err);
+    }
+
     await this.redisClient.quit();
     console.log(`[Worker ${this.workerId}] Stopped successfully.`);
+  }
+
+  private async startHeartbeat(): Promise<void> {
+    try {
+      await this.sendHeartbeat();
+    } catch (err) {
+      console.error(`[Worker ${this.workerId}] Failed to send initial heartbeat:`, err);
+    }
+    this.heartbeatTimer = setInterval(async () => {
+      try {
+        await this.sendHeartbeat();
+      } catch (err) {
+        console.error(`[Worker ${this.workerId}] Failed to send periodic heartbeat:`, err);
+      }
+    }, this.heartbeatIntervalMs);
+  }
+
+  private async sendHeartbeat(): Promise<void> {
+    const now = new Date();
+    const metadata = {
+      id: this.workerId,
+      queues: this.queues,
+      startedAt: this.startedAt.toISOString(),
+      lastHeartbeat: now.toISOString(),
+      hostname: os.hostname(),
+      pid: process.pid,
+      status: 'active'
+    };
+
+    const score = now.getTime();
+    await this.redisClient
+      .multi()
+      .zadd('workers:active', score, this.workerId)
+      .setex(`worker:info:${this.workerId}`, this.heartbeatTtlSec, JSON.stringify(metadata))
+      .exec();
   }
 
   private async ensureConsumerGroup(): Promise<void> {

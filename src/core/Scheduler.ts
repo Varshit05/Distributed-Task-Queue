@@ -155,6 +155,17 @@ export class Scheduler {
    * for too long, indicating the worker died.
    */
   private async recoverCrashedWorkers(): Promise<void> {
+    // 0. Prune dead workers from the registry (heartbeat older than 15 seconds)
+    try {
+      const now = Date.now();
+      const pruned = await this.redisClient.zremrangebyscore('workers:active', '-inf', now - 15000);
+      if (pruned > 0) {
+        console.log(`[Scheduler] Pruned ${pruned} dead worker(s) from registry.`);
+      }
+    } catch (err) {
+      console.error('[Scheduler] Failed to prune dead workers from registry:', err);
+    }
+
     // 1. Find all queues that have active tasks in PostgreSQL to avoid hardcoding streams
     const activeQueues = await db.task.findMany({
       select: { queue: true },

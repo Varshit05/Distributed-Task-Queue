@@ -416,6 +416,57 @@ app.delete('/api/cron/:id', async (req: Request, res: Response, next: NextFuncti
   }
 });
 
+// Endpoint: Get all active workers
+app.get('/api/workers', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const now = Date.now();
+    // 1. Prune dead workers from active set (inactive for > 15s)
+    await redis.zremrangebyscore('workers:active', '-inf', now - 15000);
+
+    // 2. Fetch all active worker IDs
+    const workerIds = await redis.zrange('workers:active', 0, -1);
+
+    if (workerIds.length === 0) {
+      return res.status(200).json({
+        success: true,
+        data: [],
+      });
+    }
+
+    // 3. Fetch metadata for all active workers in a pipeline
+    const pipeline = redis.pipeline();
+    for (const workerId of workerIds) {
+      pipeline.get(`worker:info:${workerId}`);
+    }
+
+    const rawResults = await pipeline.exec();
+    const workers: any[] = [];
+
+    if (rawResults) {
+      for (const [err, result] of rawResults) {
+        if (err) {
+          console.error('[Server] Error fetching worker info from Redis pipeline:', err);
+          continue;
+        }
+        if (result && typeof result === 'string') {
+          try {
+            workers.push(JSON.parse(result));
+          } catch (parseErr) {
+            console.error('[Server] Failed to parse worker metadata:', parseErr);
+          }
+        }
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: workers,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Global Error Handler
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   console.error('[Express Error]', err);
