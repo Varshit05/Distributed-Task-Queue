@@ -1,10 +1,13 @@
 import { Redis } from 'ioredis';
 import parser from 'cron-parser';
+import { randomUUID } from 'crypto';
 import { db } from '../config/database.js';
 import { createRedisClient } from '../config/redis.js';
 import { Producer } from './Producer.js';
 
 export class Scheduler {
+  public readonly id: string;
+  public isLeader = false;
   private redisClient: Redis;
   private running = false;
   private timer: NodeJS.Timeout | null = null;
@@ -14,13 +17,23 @@ export class Scheduler {
   private groupName: string;
   private claimTimeoutMs: number; // Time after which a task is considered stuck/crashed
 
+  private leaseKey: string;
+  private leaseDurationMs: number;
+  private leaseRenewIntervalMs: number;
+  private lastAcquiredOrRenewedTime = 0;
+  private leaderTimer: NodeJS.Timeout | null = null;
 
   constructor() {
+    this.id = `scheduler:${randomUUID()}`;
     this.redisClient = createRedisClient();
     this.groupName = process.env.QUEUE_GROUP_NAME || 'worker_group';
     this.claimTimeoutMs = 30000; // 30 seconds idle timeout
 
-    // Register custom Lua script for atomic delayed task dispatch
+    this.leaseKey = process.env.SCHEDULER_LEASE_KEY || 'scheduler:leader:lock';
+    this.leaseDurationMs = parseInt(process.env.SCHEDULER_LEASE_DURATION_MS || '10000', 10);
+    this.leaseRenewIntervalMs = parseInt(process.env.SCHEDULER_LEASE_RENEW_INTERVAL_MS || '3000', 10);
+
+    // Register custom Lua scripts
     this.registerLuaScripts();
   }
 
@@ -56,6 +69,44 @@ export class Scheduler {
         return due_tasks
       `
     });
+
+    // Define a command 'tryacquirelease'
+    // KEYS[1] = lease lock key
+    // ARGV[1] = scheduler ID
+    // ARGV[2] = lease duration in milliseconds (TTL)
+    this.redisClient.defineCommand('tryacquirelease', {
+      numberOfKeys: 1,
+      lua: `
+        local key = KEYS[1]
+        local id = ARGV[1]
+        local duration = tonumber(ARGV[2])
+        local current_leader = redis.call('GET', key)
+
+        if not current_leader then
+          redis.call('SET', key, id, 'PX', duration)
+          return 1
+        elseif current_leader == id then
+          redis.call('PEXPIRE', key, duration)
+          return 1
+        else
+          return 0
+        end
+      `
+    });
+
+    // Define a command 'releaselease'
+    // KEYS[1] = lease lock key
+    // ARGV[1] = scheduler ID
+    this.redisClient.defineCommand('releaselease', {
+      numberOfKeys: 1,
+      lua: `
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+          return redis.call('DEL', KEYS[1])
+        else
+          return 0
+        end
+      `
+    });
   }
 
   /**
@@ -64,13 +115,18 @@ export class Scheduler {
   public async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    console.log('[Scheduler] Starting Scheduler loops...');
+    console.log(`[Scheduler] Starting Scheduler loops... ID: ${this.id}`);
+
+    // Try to acquire lease immediately before starting polling loops
+    await this.runLeaderElection();
 
     // Loop 1: Poll delayed tasks every 1 second
     const pollDelayed = async () => {
       if (!this.running) return;
       try {
-        await this.dispatchDelayed();
+        if (this.isLeader) {
+          await this.dispatchDelayed();
+        }
       } catch (error) {
         console.error('[Scheduler] Error dispatching delayed tasks:', error);
       }
@@ -81,7 +137,9 @@ export class Scheduler {
     const pollRecovery = async () => {
       if (!this.running) return;
       try {
-        await this.recoverCrashedWorkers();
+        if (this.isLeader) {
+          await this.recoverCrashedWorkers();
+        }
       } catch (error) {
         console.error('[Scheduler] Error recovering crashed workers:', error);
       }
@@ -92,7 +150,9 @@ export class Scheduler {
     const pollCron = async () => {
       if (!this.running) return;
       try {
-        await this.dispatchCronJobs();
+        if (this.isLeader) {
+          await this.dispatchCronJobs();
+        }
       } catch (error) {
         console.error('[Scheduler] Error dispatching cron jobs:', error);
       }
@@ -103,7 +163,9 @@ export class Scheduler {
     const pollPruning = async () => {
       if (!this.running) return;
       try {
-        await this.pruneOldTasks();
+        if (this.isLeader) {
+          await this.pruneOldTasks();
+        }
       } catch (error) {
         console.error('[Scheduler] Error pruning execution history:', error);
       }
@@ -120,14 +182,61 @@ export class Scheduler {
    * Stops the scheduler background loops.
    */
   public async stop(): Promise<void> {
-    console.log('[Scheduler] Stopping Scheduler...');
+    console.log(`[Scheduler] Stopping Scheduler... ID: ${this.id}`);
     this.running = false;
     if (this.timer) clearTimeout(this.timer);
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     if (this.cronTimer) clearTimeout(this.cronTimer);
     if (this.pruningTimer) clearTimeout(this.pruningTimer);
+    if (this.leaderTimer) clearTimeout(this.leaderTimer);
+
+    if (this.isLeader) {
+      try {
+        await (this.redisClient as any).releaselease(this.leaseKey, this.id);
+        console.log(`[Scheduler] Released leader lease on shutdown. ID: ${this.id}`);
+      } catch (err) {
+        console.error(`[Scheduler] Error releasing leader lease:`, err);
+      }
+      this.isLeader = false;
+    }
+
     await this.redisClient.quit();
-    console.log('[Scheduler] Scheduler stopped.');
+    console.log(`[Scheduler] Scheduler stopped. ID: ${this.id}`);
+  }
+
+  /**
+   * Periodically attempts to acquire/renew the leader lease.
+   */
+  private async runLeaderElection(): Promise<void> {
+    if (!this.running) return;
+    try {
+      const result = await (this.redisClient as any).tryacquirelease(
+        this.leaseKey,
+        this.id,
+        this.leaseDurationMs.toString()
+      );
+
+      if (result === 1) {
+        this.lastAcquiredOrRenewedTime = Date.now();
+        if (!this.isLeader) {
+          this.isLeader = true;
+          console.log(`[Scheduler] Elected as leader. ID: ${this.id}`);
+        }
+      } else {
+        if (this.isLeader) {
+          this.isLeader = false;
+          console.log(`[Scheduler] Stepped down from leader. ID: ${this.id}`);
+        }
+      }
+    } catch (error) {
+      console.error(`[Scheduler] Error during leader election for ID ${this.id}:`, error);
+      if (this.isLeader && Date.now() - this.lastAcquiredOrRenewedTime > this.leaseDurationMs) {
+        this.isLeader = false;
+        console.warn(`[Scheduler] Lease expired without renewal due to errors. Stepped down. ID: ${this.id}`);
+      }
+    }
+
+    this.leaderTimer = setTimeout(() => this.runLeaderElection(), this.leaseRenewIntervalMs);
   }
 
   /**

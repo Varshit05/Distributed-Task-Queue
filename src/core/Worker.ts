@@ -11,6 +11,7 @@ export type TaskHandler = (
 
 export class Worker {
   private redisClient: Redis;
+  private heartbeatRedisClient: Redis;
   private running = false;
   private workerId: string;
   private queue: string;
@@ -33,6 +34,7 @@ export class Worker {
       this.queue = 'default';
     }
     this.redisClient = createRedisClient();
+    this.heartbeatRedisClient = createRedisClient();
     this.workerId = `worker:${os.hostname()}:${process.pid}:${Math.random().toString(36).substring(2, 8)}`;
     this.streamKeys = this.queues.map(q => `task_stream:${q}`);
     this.streamKey = this.streamKeys[0];
@@ -98,6 +100,7 @@ export class Worker {
     }
 
     await this.redisClient.quit();
+    await this.heartbeatRedisClient.quit();
     console.log(`[Worker ${this.workerId}] Stopped successfully.`);
   }
 
@@ -129,7 +132,7 @@ export class Worker {
     };
 
     const score = now.getTime();
-    await this.redisClient
+    await this.heartbeatRedisClient
       .multi()
       .zadd('workers:active', score, this.workerId)
       .setex(`worker:info:${this.workerId}`, this.heartbeatTtlSec, JSON.stringify(metadata))
