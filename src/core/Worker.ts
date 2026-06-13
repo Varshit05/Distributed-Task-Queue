@@ -9,6 +9,12 @@ export type TaskHandler = (
   context: { taskId: string; retryCount: number }
 ) => Promise<any>;
 
+export interface WorkerOptions {
+  workerMaxExecutions?: number;
+  workerWindowMs?: number;
+  queueRateLimits?: Record<string, { maxExecutions: number; windowMs: number }>;
+}
+
 export class Worker {
   private redisClient: Redis;
   private heartbeatRedisClient: Redis;
@@ -26,7 +32,11 @@ export class Worker {
   private heartbeatTtlSec = 15;
   private startedAt: Date;
 
-  constructor(queue = 'default') {
+  private workerMaxExecutions: number | null = null;
+  private workerWindowMs = 1000;
+  private queueRateLimits: Map<string, { maxExecutions: number; windowMs: number }> = new Map();
+
+  constructor(queue = 'default', options: WorkerOptions = {}) {
     this.queue = queue;
     this.queues = queue.split(',').map(q => q.trim()).filter(Boolean);
     if (this.queues.length === 0) {
@@ -40,6 +50,32 @@ export class Worker {
     this.streamKey = this.streamKeys[0];
     this.groupName = process.env.QUEUE_GROUP_NAME || 'worker_group';
     this.startedAt = new Date();
+
+    // Initialize rate limit options
+    this.workerMaxExecutions = options.workerMaxExecutions ?? (process.env.WORKER_MAX_EXECUTIONS ? parseInt(process.env.WORKER_MAX_EXECUTIONS, 10) : null);
+    this.workerWindowMs = options.workerWindowMs ?? (process.env.WORKER_WINDOW_MS ? parseInt(process.env.WORKER_WINDOW_MS, 10) : 1000);
+
+    if (options.queueRateLimits) {
+      for (const [q, limit] of Object.entries(options.queueRateLimits)) {
+        this.queueRateLimits.set(q, limit);
+      }
+    }
+
+    if (process.env.QUEUE_RATE_LIMITS) {
+      try {
+        const parsed = JSON.parse(process.env.QUEUE_RATE_LIMITS);
+        for (const [q, limit] of Object.entries(parsed) as any) {
+          if (limit && typeof limit.maxExecutions === 'number' && typeof limit.windowMs === 'number') {
+            this.queueRateLimits.set(q, limit);
+          }
+        }
+      } catch (err) {
+        console.error('[Worker] Failed to parse QUEUE_RATE_LIMITS environment variable:', err);
+      }
+    }
+
+    // Register custom Lua scripts
+    this.registerLuaScripts();
   }
 
   /**
@@ -164,8 +200,28 @@ export class Worker {
       try {
         let response: any = null;
 
+        // Pre-acquire worker execution slot
+        const workerExecId = `w:${Math.random().toString(36).substring(2, 9)}`;
+        const workerAllowed = await this.tryRecordWorkerExecution(workerExecId);
+
+        if (!workerAllowed) {
+          // Worker rate limited, sleep and retry
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          continue;
+        }
+
+        let taskAcquired = false;
+
         // 1. Non-blocking check of each stream in priority order
         for (const streamKey of this.streamKeys) {
+          const queueName = streamKey.replace('task_stream:', '');
+          const queueExecId = `q:${Math.random().toString(36).substring(2, 9)}`;
+
+          const queueAllowed = await this.tryRecordQueueExecution(queueName, queueExecId);
+          if (!queueAllowed) {
+            continue; // Skip this rate-limited queue
+          }
+
           const res = await this.redisClient.xreadgroup(
             'GROUP', this.groupName, this.workerId,
             'COUNT', '1',
@@ -175,8 +231,17 @@ export class Worker {
 
           if (res && res.length > 0 && res[0][1].length > 0) {
             response = res;
+            taskAcquired = true;
             break;
+          } else {
+            // Refund queue token since no task was read
+            await this.refundQueueExecution(queueName, queueExecId);
           }
+        }
+
+        if (!taskAcquired) {
+          // Refund worker token since no task was read
+          await this.refundWorkerExecution(workerExecId);
         }
 
         // 2. If all streams were empty, block on all streams together
@@ -188,6 +253,13 @@ export class Worker {
             'STREAMS', ...this.streamKeys,
             ...Array(this.streamKeys.length).fill('>')
           ) as any;
+
+          if (response && response.length > 0 && response[0][1].length > 0) {
+            const stream = response[0][0];
+            const queueName = stream.replace('task_stream:', '');
+            // Enforce rate limits post-claim on blocking reads
+            await this.enforceRateLimitsPostClaim(queueName);
+          }
         }
 
         if (!response || response.length === 0) {
@@ -412,6 +484,113 @@ export class Worker {
 
       // Acknowledge to remove it from PEL
       await this.redisClient.xack(streamKey, this.groupName, messageId);
+    }
+  }
+
+  private registerLuaScripts() {
+    this.redisClient.defineCommand('tryrecordexecution', {
+      numberOfKeys: 1,
+      lua: `
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local window = tonumber(ARGV[2])
+        local limit = tonumber(ARGV[3])
+        local exec_id = ARGV[4]
+
+        -- Clear old elements outside the sliding window
+        redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
+
+        -- Count elements currently in the window
+        local current_count = redis.call('ZCARD', key)
+
+        if current_count < limit then
+          redis.call('ZADD', key, now, exec_id)
+          redis.call('PEXPIRE', key, window)
+          return 1 -- Allowed
+        else
+          return 0 -- Rate limited
+        end
+      `
+    });
+  }
+
+  private async tryRecordWorkerExecution(execId: string): Promise<boolean> {
+    if (this.workerMaxExecutions === null) return true;
+    const key = `ratelimit:worker:${this.workerId}`;
+    try {
+      const result = await (this.redisClient as any).tryrecordexecution(
+        key,
+        Date.now().toString(),
+        this.workerWindowMs.toString(),
+        this.workerMaxExecutions.toString(),
+        execId
+      );
+      return result === 1;
+    } catch (err) {
+      console.error('[Worker] Error recording worker rate limit:', err);
+      return true; // Fail-open
+    }
+  }
+
+  private async refundWorkerExecution(execId: string): Promise<void> {
+    if (this.workerMaxExecutions === null) return;
+    const key = `ratelimit:worker:${this.workerId}`;
+    try {
+      await this.redisClient.zrem(key, execId);
+    } catch (err) {
+      console.error('[Worker] Error refunding worker rate limit:', err);
+    }
+  }
+
+  private async tryRecordQueueExecution(queueName: string, execId: string): Promise<boolean> {
+    const limit = this.queueRateLimits.get(queueName);
+    if (!limit) return true;
+    const key = `ratelimit:queue:${queueName}`;
+    try {
+      const result = await (this.redisClient as any).tryrecordexecution(
+        key,
+        Date.now().toString(),
+        limit.windowMs.toString(),
+        limit.maxExecutions.toString(),
+        execId
+      );
+      return result === 1;
+    } catch (err) {
+      console.error(`[Worker] Error recording queue "${queueName}" rate limit:`, err);
+      return true; // Fail-open
+    }
+  }
+
+  private async refundQueueExecution(queueName: string, execId: string): Promise<void> {
+    const limit = this.queueRateLimits.get(queueName);
+    if (!limit) return;
+    const key = `ratelimit:queue:${queueName}`;
+    try {
+      await this.redisClient.zrem(key, execId);
+    } catch (err) {
+      console.error(`[Worker] Error refunding queue "${queueName}" rate limit:`, err);
+    }
+  }
+
+  private async enforceRateLimitsPostClaim(queueName: string): Promise<void> {
+    const workerExecId = `w_post:${Math.random().toString(36).substring(2, 9)}`;
+    const queueExecId = `q_post:${Math.random().toString(36).substring(2, 9)}`;
+
+    while (this.running) {
+      const workerAllowed = await this.tryRecordWorkerExecution(workerExecId);
+      if (!workerAllowed) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+
+      const queueAllowed = await this.tryRecordQueueExecution(queueName, queueExecId);
+      if (!queueAllowed) {
+        await this.refundWorkerExecution(workerExecId);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+
+      break;
     }
   }
 }
