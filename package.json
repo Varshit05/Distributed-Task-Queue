@@ -8,6 +8,7 @@
     "dev:worker": "tsx src/worker-runner.ts",
     "dev:scheduler": "tsx src/scheduler-runner.ts",
     "test:queue": "tsx src/scripts/test-queue.ts",
+    "test:workflow": "tsx src/scripts/test-workflow.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "prisma:generate": "prisma generate",

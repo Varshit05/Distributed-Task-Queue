@@ -311,7 +311,7 @@ export class Worker {
 
   private async processTask(taskId: string, messageId: string, streamKey: string): Promise<void> {
     // 1. Fetch Task details from Postgres
-    const task = await db.task.findUnique({ where: { id: taskId } });
+    const task = (await db.task.findUnique({ where: { id: taskId } })) as any;
 
     if (!task) {
       console.warn(`[Worker ${this.workerId}] Task ${taskId} not found in database. Acknowledging Redis stream message.`);
@@ -319,8 +319,8 @@ export class Worker {
       return;
     }
 
-    // Idempotency check: If task is already completed or failed, ack and skip
-    if (task.status === 'completed' || task.status === 'failed') {
+    // Idempotency check: If task is already completed, failed, or cancelled, ack and skip
+    if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
       console.warn(`[Worker ${this.workerId}] Task ${taskId} is already in a final state: "${task.status}". Acknowledging.`);
       await this.redisClient.xack(streamKey, this.groupName, messageId);
       return;
@@ -341,14 +341,28 @@ export class Worker {
     };
 
     try {
-      // 2. Mark status as processing in PostgreSQL
-      await db.task.update({
-        where: { id: taskId },
+      // 2. Mark status as processing in PostgreSQL atomically
+      const started = await db.task.updateMany({
+        where: { id: taskId, status: 'pending' },
         data: {
           status: 'processing',
           startedAt: new Date(),
         },
       });
+
+      if (started.count === 0) {
+        // Already processed or cancelled
+        const freshTask = await db.task.findUnique({ where: { id: taskId } });
+        if (freshTask && freshTask.status === 'cancelled') {
+          console.warn(`[Worker ${this.workerId}] Task ${taskId} was cancelled. Acknowledging and skipping.`);
+          await this.redisClient.xack(streamKey, this.groupName, messageId);
+          return;
+        }
+        if (freshTask && (freshTask.status === 'completed' || freshTask.status === 'failed')) {
+          await this.redisClient.xack(streamKey, this.groupName, messageId);
+          return;
+        }
+      }
 
       await taskLogger(`Task execution started by ${this.workerId}`);
 
@@ -378,26 +392,44 @@ export class Worker {
       }
 
       // 5. Successful Execution
-      await db.task.update({
-        where: { id: taskId },
+      const updated = await db.task.updateMany({
+        where: { id: taskId, status: 'processing' },
         data: {
           status: 'completed',
           finishedAt: new Date(),
         },
       });
 
-      await taskLogger(`Task execution completed successfully. Result: ${JSON.stringify(result || {})}`);
+      if (updated.count === 1) {
+        await taskLogger(`Task execution completed successfully. Result: ${JSON.stringify(result || {})}`);
 
-      // Acknowledge in Redis Stream
-      await this.redisClient.xack(streamKey, this.groupName, messageId);
-      console.log(`[Worker ${this.workerId}] Successfully completed task ${taskId}`);
+        // Acknowledge in Redis Stream
+        await this.redisClient.xack(streamKey, this.groupName, messageId);
+        console.log(`[Worker ${this.workerId}] Successfully completed task ${taskId}`);
+
+        if (task.workflowId) {
+          const { WorkflowManager } = await import('./WorkflowManager.js');
+          await WorkflowManager.handleTaskCompletion(task.id);
+        }
+      } else {
+        await taskLogger(`Task execution finished, but status was not 'processing' (likely cancelled).`);
+        await this.redisClient.xack(streamKey, this.groupName, messageId);
+      }
 
     } catch (error: any) {
       const errorMsg = error.message || String(error);
+
+      const freshTask = await db.task.findUnique({ where: { id: taskId } });
+      if (freshTask && freshTask.status === 'cancelled') {
+        await taskLogger(`Task execution failed but task was already cancelled. Discarding error.`, 'warn');
+        await this.redisClient.xack(streamKey, this.groupName, messageId);
+        return;
+      }
+
       await taskLogger(`Task execution failed: ${errorMsg}`, 'error');
 
       // 6. Handle Retry Mechanism / terminal failure
-      await this.handleFailure(task.id, task.name, task.payload, task.retryCount, task.maxRetries, errorMsg, messageId, task.queue, streamKey);
+      await this.handleFailure(task.id, task.name, task.payload, task.retryCount, task.maxRetries, errorMsg, messageId, task.queue, streamKey, task.workflowId);
     }
   }
 
@@ -410,7 +442,8 @@ export class Worker {
     errorMessage: string,
     messageId: string,
     queueName: string,
-    streamKey: string
+    streamKey: string,
+    workflowId: string | null
   ): Promise<void> {
     if (currentRetryCount < maxRetries) {
       const nextRetry = currentRetryCount + 1;
@@ -422,8 +455,8 @@ export class Worker {
       console.log(`[Worker ${this.workerId}] Task ${taskId} failed. Retrying (Attempt ${nextRetry}/${maxRetries}) in ${backoffDelayMs}ms`);
 
       // Update task in PostgreSQL to pending state
-      await db.task.update({
-        where: { id: taskId },
+      const updated = await db.task.updateMany({
+        where: { id: taskId, status: 'processing' },
         data: {
           status: 'pending',
           retryCount: nextRetry,
@@ -432,27 +465,31 @@ export class Worker {
         },
       });
 
-      await db.taskLog.create({
-        data: {
-          taskId,
-          message: `Task rescheduled for retry #${nextRetry} at ${runAt.toISOString()} due to failure`,
-          level: 'warn',
-        },
-      });
+      if (updated.count === 1) {
+        await db.taskLog.create({
+          data: {
+            taskId,
+            message: `Task rescheduled for retry #${nextRetry} at ${runAt.toISOString()} due to failure`,
+            level: 'warn',
+          },
+        });
 
-      // Add task back to Redis Sorted Set for delayed execution
-      const score = runAt.getTime();
-      await this.redisClient.zadd('delayed_tasks', score, `${taskId}:${queueName}`);
+        // Add task back to Redis Sorted Set for delayed execution
+        const score = runAt.getTime();
+        await this.redisClient.zadd('delayed_tasks', score, `${taskId}:${queueName}`);
 
-      // Acknowledge this specific execution turn in the active stream (since it is now scheduled as delayed)
-      await this.redisClient.xack(streamKey, this.groupName, messageId);
+        // Acknowledge this specific execution turn in the active stream (since it is now scheduled as delayed)
+        await this.redisClient.xack(streamKey, this.groupName, messageId);
+      } else {
+        await this.redisClient.xack(streamKey, this.groupName, messageId);
+      }
 
     } else {
       // Terminal Failure
       console.error(`[Worker ${this.workerId}] Task ${taskId} failed. Retries exhausted (${maxRetries}/${maxRetries}).`);
 
-      await db.task.update({
-        where: { id: taskId },
+      const updated = await db.task.updateMany({
+        where: { id: taskId, status: 'processing' },
         data: {
           status: 'failed',
           finishedAt: new Date(),
@@ -460,30 +497,40 @@ export class Worker {
         },
       });
 
-      await db.taskLog.create({
-        data: {
-          taskId,
-          message: `Task failed permanently after ${maxRetries} retries. Error: ${errorMessage}`,
-          level: 'error',
-        },
-      });
+      if (updated.count === 1) {
+        await db.taskLog.create({
+          data: {
+            taskId,
+            message: `Task failed permanently after ${maxRetries} retries. Error: ${errorMessage}`,
+            level: 'error',
+          },
+        });
 
-      // Route to DLQ stream
-      try {
-        await this.redisClient.xadd(
-          'task_stream:dlq',
-          '*',
-          'id', taskId,
-          'originalQueue', queueName,
-          'error', errorMessage
-        );
-        console.log(`[Worker ${this.workerId}] Routed task ${taskId} to Dead Letter Queue (DLQ)`);
-      } catch (dlqError) {
-        console.error(`[Worker ${this.workerId}] Failed to push task ${taskId} to DLQ:`, dlqError);
+        // Route to DLQ stream
+        try {
+          await this.redisClient.xadd(
+            'task_stream:dlq',
+            '*',
+            'id', taskId,
+            'originalQueue', queueName,
+            'error', errorMessage
+          );
+          console.log(`[Worker ${this.workerId}] Routed task ${taskId} to Dead Letter Queue (DLQ)`);
+        } catch (dlqError) {
+          console.error(`[Worker ${this.workerId}] Failed to push task ${taskId} to DLQ:`, dlqError);
+        }
+
+        // Acknowledge to remove it from PEL
+        await this.redisClient.xack(streamKey, this.groupName, messageId);
+
+        // Cascade failure to the workflow
+        if (workflowId) {
+          const { WorkflowManager } = await import('./WorkflowManager.js');
+          await WorkflowManager.handleTaskFailure(taskId, errorMessage);
+        }
+      } else {
+        await this.redisClient.xack(streamKey, this.groupName, messageId);
       }
-
-      // Acknowledge to remove it from PEL
-      await this.redisClient.xack(streamKey, this.groupName, messageId);
     }
   }
 

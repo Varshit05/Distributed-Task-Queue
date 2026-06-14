@@ -11,11 +11,13 @@ model Task {
   id           String    @id @default(uuid())
   name         String    // e.g., "send_email", "process_video"
   queue        String    @default("default")
-  status       String    // "pending" | "processing" | "completed" | "failed"
+  status       String    // "pending" | "processing" | "completed" | "failed" | "cancelled"
   payload      Json
   retryCount   Int       @default(0)
   maxRetries   Int       @default(3)
   timeoutMs    Int?      // Max execution duration in milliseconds
+  delayMs      Int?      // Optional delay in milliseconds before executing when enqueued
+  isEnqueued   Boolean   @default(false)
   runAt        DateTime  @default(now())
   startedAt    DateTime?
   finishedAt   DateTime?
@@ -23,6 +25,14 @@ model Task {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   logs         TaskLog[]
+
+  // Workflow relations
+  workflowId   String?
+  workflow     Workflow? @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  // DAG Dependencies
+  dependencies TaskDependency[] @relation("DownstreamTasks")
+  dependents   TaskDependency[] @relation("UpstreamTasks")
 
   @@index([status, runAt])
 }
@@ -49,5 +59,24 @@ model CronJob {
   updatedAt    DateTime  @updatedAt
 
   @@index([isActive, nextRunAt])
+}
+
+model Workflow {
+  id        String   @id @default(uuid())
+  name      String
+  status    String   // "running" | "completed" | "failed"
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  tasks     Task[]
+}
+
+model TaskDependency {
+  id               String @id @default(uuid())
+  upstreamTaskId   String
+  upstreamTask     Task   @relation("UpstreamTasks", fields: [upstreamTaskId], references: [id], onDelete: Cascade)
+  downstreamTaskId String
+  downstreamTask   Task   @relation("DownstreamTasks", fields: [downstreamTaskId], references: [id], onDelete: Cascade)
+
+  @@unique([upstreamTaskId, downstreamTaskId])
 }
 

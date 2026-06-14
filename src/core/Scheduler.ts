@@ -349,6 +349,12 @@ export class Scheduler {
               continue;
             }
 
+            if (task.status === 'cancelled') {
+              // Task was cancelled (e.g. by workflow manager due to some other failure), just ack and skip
+              await this.redisClient.xack(streamKey, this.groupName, messageId);
+              continue;
+            }
+
             // Write logs and decide what to do
             const taskLogger = async (msg: string, level = 'info') => {
               console.log(`[Recovery][${taskId}] [${level.toUpperCase()}] ${msg}`);
@@ -362,8 +368,8 @@ export class Scheduler {
               const nextRetry = task.retryCount + 1;
               console.log(`[Scheduler] Rescheduling task ${taskId} for retry #${nextRetry} due to worker failure`);
 
-              await db.task.update({
-                where: { id: taskId },
+              const updated = await db.task.updateMany({
+                where: { id: taskId, status: 'processing' },
                 data: {
                   status: 'pending',
                   retryCount: nextRetry,
@@ -371,20 +377,24 @@ export class Scheduler {
                 },
               });
 
-              await taskLogger(`Worker "${consumerName}" crashed or timed out. Rescheduling task (Attempt ${nextRetry}/${task.maxRetries})`, 'warn');
+              if (updated.count === 1) {
+                await taskLogger(`Worker "${consumerName}" crashed or timed out. Rescheduling task (Attempt ${nextRetry}/${task.maxRetries})`, 'warn');
 
-              // Re-enqueue the task ID to the stream
-              await this.redisClient.xadd(streamKey, '*', 'id', taskId);
+                // Re-enqueue the task ID to the stream
+                await this.redisClient.xadd(streamKey, '*', 'id', taskId);
 
-              // Acknowledge the old message to remove it from the PEL
-              await this.redisClient.xack(streamKey, this.groupName, messageId);
+                // Acknowledge the old message to remove it from the PEL
+                await this.redisClient.xack(streamKey, this.groupName, messageId);
+              } else {
+                await this.redisClient.xack(streamKey, this.groupName, messageId);
+              }
             } else {
               // Max retries exceeded
               console.log(`[Scheduler] Mark task ${taskId} as failed. Retries exhausted.`);
 
               const failMsg = `Worker "${consumerName}" crashed or timed out. Retries exhausted.`;
-              await db.task.update({
-                where: { id: taskId },
+              const updated = await db.task.updateMany({
+                where: { id: taskId, status: 'processing' },
                 data: {
                   status: 'failed',
                   finishedAt: new Date(),
@@ -392,24 +402,34 @@ export class Scheduler {
                 },
               });
 
-              await taskLogger(failMsg, 'error');
+              if (updated.count === 1) {
+                await taskLogger(failMsg, 'error');
 
-              // Route to DLQ stream
-              try {
-                await this.redisClient.xadd(
-                  'task_stream:dlq',
-                  '*',
-                  'id', taskId,
-                  'originalQueue', queue,
-                  'error', failMsg
-                );
-                console.log(`[Scheduler] Routed recovery-failed task ${taskId} to Dead Letter Queue (DLQ)`);
-              } catch (dlqError) {
-                console.error(`[Scheduler] Failed to push recovery-failed task ${taskId} to DLQ:`, dlqError);
+                // Route to DLQ stream
+                try {
+                  await this.redisClient.xadd(
+                    'task_stream:dlq',
+                    '*',
+                    'id', taskId,
+                    'originalQueue', queue,
+                    'error', failMsg
+                  );
+                  console.log(`[Scheduler] Routed recovery-failed task ${taskId} to Dead Letter Queue (DLQ)`);
+                } catch (dlqError) {
+                  console.error(`[Scheduler] Failed to push recovery-failed task ${taskId} to DLQ:`, dlqError);
+                }
+
+                // Acknowledge the old message to remove it from the PEL
+                await this.redisClient.xack(streamKey, this.groupName, messageId);
+
+                // Cascade failure to the workflow
+                if (task.workflowId) {
+                  const { WorkflowManager } = await import('./WorkflowManager.js');
+                  await WorkflowManager.handleTaskFailure(taskId, failMsg);
+                }
+              } else {
+                await this.redisClient.xack(streamKey, this.groupName, messageId);
               }
-
-              // Acknowledge the old message to remove it from the PEL
-              await this.redisClient.xack(streamKey, this.groupName, messageId);
             }
           }
         }

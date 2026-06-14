@@ -38,6 +38,7 @@ export class Producer {
         maxRetries,
         timeoutMs: options.timeoutMs,
         runAt,
+        isEnqueued: true,
       },
     });
 
